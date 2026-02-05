@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime/debug"
 	"strings"
@@ -355,26 +356,65 @@ func checkSingleInstance() bool {
 	return true
 }
 
+var cleanupDone bool
+var cleanupMutex sync.Mutex
+
+func cleanupOnExit() {
+	cleanupMutex.Lock()
+	defer cleanupMutex.Unlock()
+
+	if cleanupDone {
+		return
+	}
+
+	if _, err := os.Stat(caCertFile); os.IsNotExist(err) {
+		return
+	}
+
+	modifyHosts(false)
+	uninstallCACert()
+	cleanupDone = true
+}
+
+func setupSignalHandler() {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		cleanupOnExit()
+		if proxyRunning {
+			stopProxy()
+		}
+		if notifyIcon != nil {
+			notifyIcon.Dispose()
+		}
+		os.Exit(0)
+	}()
+}
+
 func main() {
-	// 全局 panic 恢复
 	defer func() {
 		if r := recover(); r != nil {
+			cleanupOnExit()
 			errMsg := fmt.Sprintf("程序崩溃: %v\n%s", r, debug.Stack())
 			os.WriteFile("crash.log", []byte(errMsg), 0644)
 			walk.MsgBox(nil, "程序错误", fmt.Sprintf("程序发生错误: %v\n\n详情已保存到 crash.log", r), walk.MsgBoxIconError)
 		}
 	}()
 
-	// 检查单实例
+	defer cleanupOnExit()
+
 	if !checkSingleInstance() {
 		walk.MsgBox(nil, "提示", "程序已在运行中", walk.MsgBoxIconWarning)
 		return
 	}
 
-	// 获取工作目录
 	exePath, _ := os.Executable()
 	workDir = filepath.Dir(exePath)
 	os.Chdir(workDir)
+
+	setupSignalHandler()
 
 	// 加载配置
 	loadConfig()
@@ -547,8 +587,16 @@ func main() {
 
 	// 设置窗口关闭行为
 	mainWindow.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
-		*canceled = true
-		mainWindow.Hide()
+		if reason == walk.CloseReasonUser {
+			*canceled = true
+			mainWindow.Hide()
+		} else {
+			cleanupOnExit()
+			stopProxy()
+			if notifyIcon != nil {
+				notifyIcon.Dispose()
+			}
+		}
 	})
 
 	// 检测证书状态
@@ -607,6 +655,7 @@ func createTrayIcon(icon *walk.Icon) {
 	exitAction := walk.NewAction()
 	exitAction.SetText("退出")
 	exitAction.Triggered().Attach(func() {
+		cleanupOnExit()
 		stopProxy()
 		notifyIcon.Dispose()
 		mainWindow.Close()
@@ -885,13 +934,37 @@ func startProxy() {
 
 	saveConfig()
 
-	// 检查证书
 	if _, err := os.Stat(caCertFile); os.IsNotExist(err) {
-		walk.MsgBox(mainWindow, "错误", "证书文件不存在！请先点击「安装证书」", walk.MsgBoxIconError)
-		return
+		appendLog("📜 证书不存在，自动生成...")
+		if err := generateCertificates(); err != nil {
+			appendLog(fmt.Sprintf("❌ 生成证书失败: %v", err))
+			return
+		}
+		appendLog("✅ 证书生成完成")
 	}
 
-	// 加载证书
+	appendLog("📝 添加 hosts 劫持...")
+	if err := modifyHosts(true); err != nil {
+		appendLog(fmt.Sprintf("❌ 修改 hosts 失败: %v", err))
+		appendLog("请以管理员身份运行程序")
+		return
+	}
+	appendLog("✅ hosts 已更新")
+
+	appendLog("🔐 安装 CA 证书...")
+	if err := installCACert(); err != nil {
+		appendLog(fmt.Sprintf("❌ 安装证书失败: %v", err))
+		appendLog("请以管理员身份运行程序")
+		modifyHosts(false)
+		return
+	}
+	appendLog("✅ CA 证书已安装")
+
+	certInstalled = true
+	mainWindow.Synchronize(func() {
+		certButton.SetText("🗑️ 卸载证书")
+	})
+
 	if err := loadCertificates(); err != nil {
 		appendLog(fmt.Sprintf("❌ 加载证书失败: %v", err))
 		return
@@ -2493,6 +2566,10 @@ func modifyHosts(add bool) error {
 		if shouldKeep {
 			newLines = append(newLines, line)
 		}
+	}
+
+	for len(newLines) > 0 && strings.TrimSpace(newLines[len(newLines)-1]) == "" {
+		newLines = newLines[:len(newLines)-1]
 	}
 
 	if add {
