@@ -1,0 +1,58 @@
+{
+  "RT_GROUP_ICON": {
+    "APP": {
+      "0000": "../icon.ico"
+    }
+  },
+  "RT_MANIFEST": {
+    "#1": {
+      "0409": {
+        "identity": {
+          "name": "AnthropicProxy",
+          "version": "1.0.0.0"
+        },
+        "description": "OpenAI to Anthropic Protocol Proxy",
+        "minimum-os": "win7",
+        "execution-level": "requireAdministrator",
+        "ui-access": false,
+        "auto-elevate": false,
+        "dpi-awareness": "system",
+        "disable-theming": false,
+        "disable-window-filtering": false,
+        "high-resolution-scrolling-aware": false,
+        "ultra-high-resolution-scrolling-aware": false,
+        "long-path-aware": false,
+        "printer-driver-isolation": false,
+        "gdi-scaling": false,
+        "segment-heap": false,
+        "use-common-controls-v6": true
+      }
+    }
+  },
+  "RT_VERSION": {
+    "#1": {
+      "0000": {
+        "fixed": {
+          "file_version": "1.0.0.0",
+          "product_version": "1.0.0.0"
+        },
+        "info": {
+          "0409": {
+            "Comments": "",
+            "CompanyName": "",
+            "FileDescription": "OpenAI to Anthropic Protocol Proxy",
+            "FileVersion": "1.0.0.0",
+            "InternalName": "AnthropicProxy",
+            "LegalCopyright": "",
+            "LegalTrademarks": "",
+            "OriginalFilename": "AnthropicProxy.exe",
+            "PrivateBuild": "",
+            "ProductName": "AnthropicProxy",
+            "ProductVersion": "1.0.0.0",
+            "SpecialBuild": ""
+          }
+        }
+      }
+    }
+  }
+}
