@@ -684,6 +684,7 @@ func saveConfig() {
 }
 
 func appendLog(msg string) {
+	msg = strings.ReplaceAll(msg, "\x00", "")
 	timestamp := time.Now().Format("15:04:05")
 	logLine := fmt.Sprintf("[%s] %s\r\n", timestamp, msg)
 
