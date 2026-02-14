@@ -20,6 +20,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -253,17 +254,19 @@ type GeminiUsage struct {
 
 // 协议模式常量
 const (
-	ModeOpenAI    = 0
-	ModeAnthropic = 1
+	ModeOpenAI        = 0
+	ModeAnthropic     = 1
+	ModeOpenAIConvert = 2
 )
 
-var protocolModes = []string{"OpenAI (直连)", "Anthropic (Claude)"}
+var protocolModes = []string{"OpenAI (直连)", "Anthropic (Claude)", "OpenAI (转换)"}
 
 type Config struct {
 	TargetURL     string            `json:"target_url"`
 	ListenAddr    string            `json:"listen_addr"`
 	ProtocolMode  int               `json:"protocol_mode"`
 	ModelMappings map[string]string `json:"model_mappings"`
+	ShowLog       bool              `json:"show_log"`
 }
 
 // ==================== 全局变量 ====================
@@ -283,6 +286,10 @@ var (
 	notifyIcon     *walk.NotifyIcon
 	mappingTable   *walk.TableView
 	mappingModel   *MappingTableModel
+	logCheckBox    *walk.CheckBox
+	logGroupBox    *walk.GroupBox
+	logBottomBar   *walk.Composite
+	logFile        *os.File
 
 	proxyServer   *http.Server
 	proxyRunning  bool
@@ -291,6 +298,15 @@ var (
 	caCert        *x509.Certificate
 	caKey         *rsa.PrivateKey
 	certInstalled bool
+
+	httpClient = &http.Client{
+		Timeout: 300 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
 )
 
 type MappingItem struct {
@@ -300,7 +316,10 @@ type MappingItem struct {
 
 type MappingTableModel struct {
 	walk.TableModelBase
-	items []MappingItem
+	walk.SorterBase
+	items   []MappingItem
+	sortCol int
+	sortAsc bool
 }
 
 func (m *MappingTableModel) RowCount() int {
@@ -321,12 +340,35 @@ func (m *MappingTableModel) Value(row, col int) interface{} {
 	return ""
 }
 
+func (m *MappingTableModel) Sort(col int, order walk.SortOrder) error {
+	m.sortCol = col
+	m.sortAsc = order == walk.SortAscending
+	sort.Slice(m.items, func(i, j int) bool {
+		var less bool
+		switch col {
+		case 0:
+			less = m.items[i].Source < m.items[j].Source
+		case 1:
+			less = m.items[i].Target < m.items[j].Target
+		}
+		if !m.sortAsc {
+			less = !less
+		}
+		return less
+	})
+	m.PublishRowsReset()
+	return nil
+}
+
 func (m *MappingTableModel) ResetRows() {
-	m.items = m.items[:0]
+	m.items = nil
 	if config.ModelMappings != nil {
 		for source, target := range config.ModelMappings {
 			m.items = append(m.items, MappingItem{Source: source, Target: target})
 		}
+		sort.Slice(m.items, func(i, j int) bool {
+			return m.items[i].Source < m.items[j].Source
+		})
 	}
 	m.PublishRowsReset()
 }
@@ -373,6 +415,10 @@ func cleanupOnExit() {
 
 	modifyHosts(false)
 	uninstallCACert()
+	if logFile != nil {
+		logFile.Close()
+		logFile = nil
+	}
 	cleanupDone = true
 }
 
@@ -418,10 +464,14 @@ func main() {
 
 	// 加载配置
 	loadConfig()
+	updateLogMode()
 
 	// 计算窗口居中位置
 	windowWidth := 600
 	windowHeight := 480
+	if !config.ShowLog {
+		windowHeight = 240
+	}
 	bounds := getWindowCenterBounds(windowWidth, windowHeight)
 
 	// 创建主窗口
@@ -437,7 +487,7 @@ func main() {
 	err = MainWindow{
 		AssignTo: &mainWindow,
 		Title:    "OpenAI → Anthropic 协议转换代理",
-		MinSize:  Size{Width: 600, Height: 480},
+		MinSize:  Size{Width: 600, Height: 240},
 		Bounds:   bounds,
 		Layout:   VBox{MarginsZero: false, Margins: Margins{Left: 10, Top: 10, Right: 10, Bottom: 10}},
 		Children: []Widget{
@@ -490,6 +540,29 @@ func main() {
 										Text:      "🔗 测试连接",
 										OnClicked: onTestButtonClicked,
 									},
+									CheckBox{
+										AssignTo: &logCheckBox,
+										Text:     "显示日志",
+										Checked:  config.ShowLog,
+										OnCheckedChanged: func() {
+											config.ShowLog = logCheckBox.Checked()
+											if logGroupBox != nil {
+												logGroupBox.SetVisible(config.ShowLog)
+											}
+											if logBottomBar != nil {
+												logBottomBar.SetVisible(config.ShowLog)
+											}
+											bounds := mainWindow.Bounds()
+											if config.ShowLog {
+												bounds.Height = 480
+											} else {
+												bounds.Height = 240
+											}
+											mainWindow.SetBounds(bounds)
+											updateLogMode()
+											saveConfig()
+										},
+									},
 									HSpacer{},
 									Label{
 										AssignTo: &statusLabel,
@@ -498,8 +571,10 @@ func main() {
 								},
 							},
 							GroupBox{
-								Title:  "日志",
-								Layout: VBox{},
+								AssignTo: &logGroupBox,
+								Title:    "日志",
+								Visible:  config.ShowLog,
+								Layout:   VBox{},
 								Children: []Widget{
 									TextEdit{
 										AssignTo:  &logTextEdit,
@@ -510,7 +585,9 @@ func main() {
 								},
 							},
 							Composite{
-								Layout: HBox{},
+								AssignTo: &logBottomBar,
+								Visible:  config.ShowLog,
+								Layout:   HBox{},
 								Children: []Widget{
 									PushButton{
 										Text: "清空日志",
@@ -519,12 +596,6 @@ func main() {
 										},
 									},
 									HSpacer{},
-									PushButton{
-										Text: "最小化到托盘",
-										OnClicked: func() {
-											mainWindow.Hide()
-										},
-									},
 								},
 							},
 						},
@@ -548,24 +619,6 @@ func main() {
 									return mappingModel
 								}(),
 							},
-							Composite{
-								Layout: HBox{},
-								Children: []Widget{
-									PushButton{
-										Text:      "➕ 添加映射",
-										OnClicked: onAddMappingClicked,
-									},
-									PushButton{
-										Text:      "✏️ 编辑映射",
-										OnClicked: onEditMappingClicked,
-									},
-									PushButton{
-										Text:      "🗑️ 删除映射",
-										OnClicked: onDeleteMappingClicked,
-									},
-									HSpacer{},
-								},
-							},
 						},
 					},
 				},
@@ -582,6 +635,26 @@ func main() {
 		mainWindow.SetIcon(icon)
 	}
 
+	mappingMenu, _ := walk.NewMenu()
+	addAction := walk.NewAction()
+	addAction.SetText("添加映射")
+	addAction.Triggered().Attach(func() { onAddMappingClicked() })
+	mappingMenu.Actions().Add(addAction)
+
+	editAction := walk.NewAction()
+	editAction.SetText("编辑映射")
+	editAction.Triggered().Attach(func() { onEditMappingClicked() })
+	mappingMenu.Actions().Add(editAction)
+
+	mappingMenu.Actions().Add(walk.NewSeparatorAction())
+
+	deleteAction := walk.NewAction()
+	deleteAction.SetText("删除映射")
+	deleteAction.Triggered().Attach(func() { onDeleteMappingClicked() })
+	mappingMenu.Actions().Add(deleteAction)
+
+	mappingTable.SetContextMenu(mappingMenu)
+
 	// 创建托盘图标
 	createTrayIcon(icon)
 
@@ -596,6 +669,17 @@ func main() {
 			if notifyIcon != nil {
 				notifyIcon.Dispose()
 			}
+		}
+	})
+
+	user32dll := syscall.NewLazyDLL("user32.dll")
+	isIconic := user32dll.NewProc("IsIconic")
+	showWindowProc := user32dll.NewProc("ShowWindow")
+	mainWindow.SizeChanged().Attach(func() {
+		ret, _, _ := isIconic.Call(uintptr(mainWindow.Handle()))
+		if ret != 0 {
+			showWindowProc.Call(uintptr(mainWindow.Handle()), 9)
+			mainWindow.Hide()
 		}
 	})
 
@@ -670,7 +754,8 @@ func loadConfig() {
 	config = Config{
 		TargetURL:    "http://ai.32l.cn",
 		ListenAddr:   "127.0.0.1",
-		ProtocolMode: ModeAnthropic, // 默认 Anthropic
+		ProtocolMode: ModeAnthropic,
+		ShowLog:      true,
 		ModelMappings: map[string]string{
 			"claude-sonnet-4-5-20250929": "claude-sonnet-4-5-thinking",
 			"claude-opus-4-1-20250805":   "claude-opus-4-5-thinking",
@@ -732,15 +817,38 @@ func saveConfig() {
 	os.WriteFile(configFile, data, 0644)
 }
 
+func updateLogMode() {
+	if config.ShowLog {
+		if logFile != nil {
+			logFile.Close()
+			logFile = nil
+		}
+	} else {
+		if logFile == nil {
+			exePath, _ := os.Executable()
+			logName := strings.TrimSuffix(filepath.Base(exePath), filepath.Ext(exePath)) + ".log"
+			logPath := filepath.Join(filepath.Dir(exePath), logName)
+			f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+			if err == nil {
+				logFile = f
+			}
+		}
+	}
+}
+
 func appendLog(msg string) {
 	msg = strings.ReplaceAll(msg, "\x00", "")
 	timestamp := time.Now().Format("15:04:05")
 	logLine := fmt.Sprintf("[%s] %s\r\n", timestamp, msg)
 
-	if logTextEdit != nil {
+	if config.ShowLog && logTextEdit != nil {
 		mainWindow.Synchronize(func() {
 			logTextEdit.AppendText(logLine)
 		})
+	}
+
+	if logFile != nil {
+		logFile.WriteString(logLine)
 	}
 }
 
@@ -1204,7 +1312,11 @@ func maskAPIKey(key string) string {
 }
 
 func handleRequest(w http.ResponseWriter, r *http.Request) {
-	appendLog(fmt.Sprintf("➡️ %s %s (Host: %s, Headers: Authorization=%s)", r.Method, r.URL.Path, r.Host, maskAPIKey(r.Header.Get("Authorization"))))
+	queryStr := ""
+	if r.URL.RawQuery != "" {
+		queryStr = "?" + r.URL.RawQuery
+	}
+	appendLog(fmt.Sprintf("➡️ %s %s%s (Host: %s, Auth=%s)", r.Method, r.URL.Path, queryStr, r.Host, maskAPIKey(r.Header.Get("Authorization"))))
 
 	path := r.URL.Path
 	isGeminiHost := r.Host == "generativelanguage.googleapis.com"
@@ -1222,13 +1334,13 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "POST" {
 		switch path {
 		case "/v1/chat/completions":
-			handleChatCompletion(w, r)
+			handleChatCompletion(w, r, path)
 			return
 		case "/v1/completions":
-			handleChatCompletion(w, r)
+			handleChatCompletion(w, r, path)
 			return
 		case "/v1/responses":
-			handleChatCompletion(w, r)
+			handleChatCompletion(w, r, path)
 			return
 		}
 	}
@@ -1256,13 +1368,28 @@ func handlePassthrough(w http.ResponseWriter, r *http.Request) {
 		var reqBody map[string]interface{}
 		if err := json.Unmarshal(body, &reqBody); err == nil {
 			if model, ok := reqBody["model"].(string); ok {
+				originalModel := model
+				if strings.Contains(model, "/") {
+					parts := strings.SplitN(model, "/", 2)
+					if len(parts) == 2 {
+						model = parts[1]
+					}
+				}
+				stream, _ := reqBody["stream"].(bool)
+				maxTokens, _ := reqBody["max_tokens"].(float64)
+				appendLog(fmt.Sprintf("📋 原始请求参数: model=%s, stream=%v, max_tokens=%v", originalModel, stream, int(maxTokens)))
+				mapped := false
 				if config.ModelMappings != nil {
 					if mappedModel, exists := config.ModelMappings[model]; exists {
-						appendLog(fmt.Sprintf("🔄 模型映射: %s -> %s", model, mappedModel))
+						appendLog(fmt.Sprintf("🔄 模型映射: %s -> %s", originalModel, mappedModel))
 						reqBody["model"] = mappedModel
 						newBody, _ := json.Marshal(reqBody)
 						body = newBody
+						mapped = true
 					}
+				}
+				if !mapped {
+					appendLog(fmt.Sprintf("⚠️ 未匹配映射规则, 实际发送模型: %s", model))
 				}
 			}
 		}
@@ -1292,14 +1419,53 @@ func handlePassthrough(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	client := &http.Client{Timeout: 300 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		appendLog(fmt.Sprintf("❌ 透传请求失败: %v", err))
 		http.Error(w, "Failed to reach target server", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
+
+	contentType := resp.Header.Get("Content-Type")
+	isStreamResponse := strings.Contains(contentType, "text/event-stream")
+
+	if isStreamResponse {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			appendLog("❌ 不支持流式响应")
+			http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+			return
+		}
+
+		for key, values := range resp.Header {
+			for _, value := range values {
+				w.Header().Add(key, value)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		flusher.Flush()
+
+		appendLog(fmt.Sprintf("📤 透传流式响应: %d", resp.StatusCode))
+
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := resp.Body.Read(buf)
+			if n > 0 {
+				w.Write(buf[:n])
+				flusher.Flush()
+			}
+			if err != nil {
+				if err != io.EOF {
+					appendLog(fmt.Sprintf("❌ 读取流失败: %v", err))
+				}
+				break
+			}
+		}
+
+		appendLog("⬅️ 透传流式响应完成")
+		return
+	}
 
 	respBody, _ := io.ReadAll(resp.Body)
 
@@ -1310,6 +1476,8 @@ func handlePassthrough(w http.ResponseWriter, r *http.Request) {
 		} else if isGeminiHost {
 			respBody = convertGeminiToOpenAIModelFormat(respBody)
 			appendLog("🔄 已转换模型列表为 OpenAI 格式 (Gemini)")
+		} else {
+			respBody = injectMappingModelsToOpenAI(respBody)
 		}
 	}
 
@@ -1318,6 +1486,10 @@ func handlePassthrough(w http.ResponseWriter, r *http.Request) {
 	} else {
 		previewLen := min(500, len(respBody))
 		appendLog(fmt.Sprintf("📥 透传响应: %d (%d bytes) 内容预览: %s", resp.StatusCode, len(respBody), string(respBody[:previewLen])))
+		if logFile != nil && len(respBody) > previewLen {
+			timestamp := time.Now().Format("15:04:05")
+			logFile.WriteString(fmt.Sprintf("[%s] 📥 完整响应: %s\r\n", timestamp, string(respBody)))
+		}
 	}
 
 	for key, values := range resp.Header {
@@ -1367,7 +1539,7 @@ func convertToAnthropicModelFormat(respBody []byte) []byte {
 	for _, m := range modelResp.Data {
 		if strings.HasPrefix(m.ID, "claude") || strings.Contains(m.ID, "claude") {
 			displayName := strings.ReplaceAll(m.ID, "-", " ")
-			displayName = strings.Title(displayName)
+			displayName = toTitleCase(displayName)
 			createdAt := time.Unix(m.Created, 0).Format(time.RFC3339)
 
 			anthropicModels = append(anthropicModels, AnthropicModel{
@@ -1383,19 +1555,25 @@ func convertToAnthropicModelFormat(respBody []byte) []byte {
 		return respBody
 	}
 
-	// 添加额外的模型别名
-	additionalModels := []AnthropicModel{
-		{Type: "model", ID: "claude-opus-4-1-20250805", DisplayName: "Claude Opus 4 1 20250805", CreatedAt: time.Now().Format(time.RFC3339)},
-	}
-
+	// 从映射表自动注入源模型名称到模型列表
 	existingIDs := make(map[string]bool)
 	for _, m := range anthropicModels {
 		existingIDs[m.ID] = true
 	}
 
-	for _, m := range additionalModels {
-		if !existingIDs[m.ID] {
-			anthropicModels = append(anthropicModels, m)
+	if config.ModelMappings != nil {
+		for source := range config.ModelMappings {
+			if !existingIDs[source] {
+				displayName := strings.ReplaceAll(source, "-", " ")
+				displayName = toTitleCase(displayName)
+				anthropicModels = append(anthropicModels, AnthropicModel{
+					Type:        "model",
+					ID:          source,
+					DisplayName: displayName,
+					CreatedAt:   time.Now().Format(time.RFC3339),
+				})
+				existingIDs[source] = true
+			}
 		}
 	}
 
@@ -1479,19 +1657,61 @@ func convertGeminiToOpenAIModelFormat(respBody []byte) []byte {
 	return newBody
 }
 
-func handleModels(w http.ResponseWriter, r *http.Request) {
-	models := []map[string]interface{}{
-		{"id": "gpt-4", "object": "model", "created": time.Now().Unix(), "owned_by": "openai"},
-		{"id": "gpt-4o", "object": "model", "created": time.Now().Unix(), "owned_by": "openai"},
-		{"id": "gpt-3.5-turbo", "object": "model", "created": time.Now().Unix(), "owned_by": "openai"},
+func injectMappingModelsToOpenAI(respBody []byte) []byte {
+	if config.ModelMappings == nil || len(config.ModelMappings) == 0 {
+		return respBody
 	}
 
-	response := map[string]interface{}{"object": "list", "data": models}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	var modelResp struct {
+		Object string `json:"object"`
+		Data   []struct {
+			ID      string `json:"id"`
+			Object  string `json:"object"`
+			Created int64  `json:"created"`
+			OwnedBy string `json:"owned_by"`
+		} `json:"data"`
+	}
+
+	if err := json.Unmarshal(respBody, &modelResp); err != nil {
+		return respBody
+	}
+
+	existingIDs := make(map[string]bool)
+	for _, m := range modelResp.Data {
+		existingIDs[m.ID] = true
+	}
+
+	injected := 0
+	for source := range config.ModelMappings {
+		if !existingIDs[source] {
+			modelResp.Data = append(modelResp.Data, struct {
+				ID      string `json:"id"`
+				Object  string `json:"object"`
+				Created int64  `json:"created"`
+				OwnedBy string `json:"owned_by"`
+			}{
+				ID:      source,
+				Object:  "model",
+				Created: time.Now().Unix(),
+				OwnedBy: "mapped",
+			})
+			existingIDs[source] = true
+			injected++
+		}
+	}
+
+	if injected > 0 {
+		appendLog(fmt.Sprintf("🔄 已注入 %d 个映射模型到 OpenAI 模型列表", injected))
+	}
+
+	newBody, err := json.Marshal(modelResp)
+	if err != nil {
+		return respBody
+	}
+	return newBody
 }
 
-func handleChatCompletion(w http.ResponseWriter, r *http.Request) {
+func handleChatCompletion(w http.ResponseWriter, r *http.Request, apiPath string) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		appendLog(fmt.Sprintf("❌ 读取请求失败: %v", err))
@@ -1534,22 +1754,31 @@ func handleChatCompletion(w http.ResponseWriter, r *http.Request) {
 	// 根据协议模式选择不同的处理
 	switch config.ProtocolMode {
 	case ModeOpenAI:
-		handleOpenAIDirect(w, r, body, openaiReq)
+		handleOpenAIDirect(w, r, body, openaiReq, apiPath)
 	case ModeAnthropic:
 		handleAnthropicConvert(w, r, openaiReq)
+	case ModeOpenAIConvert:
+		handleOpenAIConvert(w, r, openaiReq, apiPath)
 	default:
 		handleAnthropicConvert(w, r, openaiReq)
 	}
 }
 
 // OpenAI 直连模式
-func handleOpenAIDirect(w http.ResponseWriter, r *http.Request, body []byte, openaiReq OpenAIRequest) {
+func handleOpenAIDirect(w http.ResponseWriter, r *http.Request, body []byte, openaiReq OpenAIRequest, apiPath string) {
 	appendLog(fmt.Sprintf("🔄 OpenAI 直连: model=%s, stream=%v", openaiReq.Model, openaiReq.Stream))
 
-	targetURL := config.TargetURL + "/v1/chat/completions"
+	openaiBody, err := json.Marshal(openaiReq)
+	if err != nil {
+		appendLog(fmt.Sprintf("❌ 序列化请求失败: %v", err))
+		http.Error(w, "Failed to marshal request", http.StatusInternalServerError)
+		return
+	}
+
+	targetURL := config.TargetURL + apiPath
 	appendLog(fmt.Sprintf("📤 目标: %s", targetURL))
 
-	req, err := http.NewRequest("POST", targetURL, bytes.NewReader(body))
+	req, err := http.NewRequest("POST", targetURL, bytes.NewReader(openaiBody))
 	if err != nil {
 		appendLog(fmt.Sprintf("❌ 创建请求失败: %v", err))
 		http.Error(w, "Failed to create request", http.StatusInternalServerError)
@@ -1561,8 +1790,7 @@ func handleOpenAIDirect(w http.ResponseWriter, r *http.Request, body []byte, ope
 		req.Header.Set("Authorization", authHeader)
 	}
 
-	client := &http.Client{Timeout: 300 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		appendLog(fmt.Sprintf("❌ 请求目标服务器失败: %v", err))
 		http.Error(w, "Failed to reach target server", http.StatusBadGateway)
@@ -1590,6 +1818,141 @@ func handleOpenAIDirect(w http.ResponseWriter, r *http.Request, body []byte, ope
 	io.Copy(w, resp.Body)
 
 	appendLog("⬅️ OpenAI 响应已透传")
+}
+
+// OpenAI 转换模式 - 将请求转换为标准 OpenAI 格式发送
+func handleOpenAIConvert(w http.ResponseWriter, r *http.Request, openaiReq OpenAIRequest, apiPath string) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			appendLog(fmt.Sprintf("❌ OpenAI 转换 panic: %v", rec))
+		}
+	}()
+
+	appendLog(fmt.Sprintf("🔄 OpenAI 转换: model=%s, stream=%v", openaiReq.Model, openaiReq.Stream))
+
+	openaiBody, err := json.Marshal(openaiReq)
+	if err != nil {
+		appendLog(fmt.Sprintf("❌ 序列化请求失败: %v", err))
+		http.Error(w, "Failed to marshal request", http.StatusInternalServerError)
+		return
+	}
+
+	targetURL := config.TargetURL + apiPath
+	appendLog(fmt.Sprintf("📤 目标: %s", targetURL))
+
+	req, err := http.NewRequest("POST", targetURL, nil)
+	if err != nil {
+		appendLog(fmt.Sprintf("❌ 创建请求失败: %v", err))
+		http.Error(w, "Failed to create request", http.StatusInternalServerError)
+		return
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	if authHeader := r.Header.Get("Authorization"); authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
+	}
+
+	resp, err := doRequestWithRetry(req, openaiBody, 3)
+	if err != nil {
+		appendLog(fmt.Sprintf("❌ 请求失败: %v", err))
+		http.Error(w, "Failed to reach target server", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	handleOpenAIStreamResponse(w, resp, openaiReq.Model)
+}
+
+// 处理 OpenAI 流式响应
+func handleOpenAIStreamResponse(w http.ResponseWriter, resp *http.Response, originalModel string) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			appendLog(fmt.Sprintf("❌ OpenAI Stream panic: %v", rec))
+		}
+	}()
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		appendLog("❌ 不支持流式响应")
+		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	appendLog(fmt.Sprintf("📥 响应状态: %d", resp.StatusCode))
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		appendLog(fmt.Sprintf("❌ OpenAI 错误 %d: %s", resp.StatusCode, string(body)))
+		w.WriteHeader(resp.StatusCode)
+		w.Write(body)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	reader := bufio.NewReaderSize(resp.Body, 128*1024)
+	eventCount := 0
+	textChunks := 0
+
+	sentDone := false
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			appendLog(fmt.Sprintf("❌ 读取流失败: %v", err))
+			break
+		}
+
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			sentDone = true
+			break
+		}
+
+		var chunk OpenAIStreamChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+
+		eventCount++
+		chunkData, _ := json.Marshal(chunk)
+		_, writeErr := fmt.Fprintf(w, "data: %s\n\n", chunkData)
+		if writeErr != nil {
+			appendLog(fmt.Sprintf("❌ 写入响应失败: %v", writeErr))
+			break
+		}
+		flusher.Flush()
+
+		if len(chunk.Choices) > 0 {
+			if content, ok := chunk.Choices[0].Delta.Content.(string); ok && content != "" {
+				textChunks++
+			}
+		}
+	}
+
+	if !sentDone {
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	}
+
+	appendLog(fmt.Sprintf("⬅️ OpenAI Stream 完成，处理了 %d 个事件，%d 个文本块", eventCount, textChunks))
 }
 
 // Anthropic 转换模式
@@ -1622,37 +1985,16 @@ func isRetryableError(err error, statusCode int) (bool, string) {
 	return false, ""
 }
 
-func handleAnthropicConvert(w http.ResponseWriter, r *http.Request, openaiReq OpenAIRequest) {
-	anthropicReq := convertToAnthropicRequest(openaiReq)
-
-	appendLog(fmt.Sprintf("🔄 转换 Anthropic: model=%s, stream=%v", openaiReq.Model, openaiReq.Stream))
-
-	anthropicBody, _ := json.Marshal(anthropicReq)
-
-	targetURL := config.TargetURL + "/v1/messages"
-
-	maxRetries := 3
+func doRequestWithRetry(req *http.Request, body []byte, maxRetries int) (*http.Response, error) {
 	var resp *http.Response
 	var lastErr error
-	var lastReason string
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		req, err := http.NewRequest("POST", targetURL, bytes.NewReader(anthropicBody))
-		if err != nil {
-			appendLog(fmt.Sprintf("❌ 创建请求失败: %v", err))
-			http.Error(w, "Failed to create request", http.StatusInternalServerError)
-			return
+		if body != nil {
+			req.Body = io.NopCloser(bytes.NewReader(body))
 		}
 
-		req.Header.Set("Content-Type", "application/json")
-		if authHeader := r.Header.Get("Authorization"); authHeader != "" {
-			apiKey := strings.TrimPrefix(authHeader, "Bearer ")
-			req.Header.Set("x-api-key", apiKey)
-		}
-		req.Header.Set("anthropic-version", "2023-06-01")
-
-		client := &http.Client{Timeout: 300 * time.Second}
-		resp, lastErr = client.Do(req)
+		resp, lastErr = httpClient.Do(req)
 
 		statusCode := 0
 		if resp != nil {
@@ -1661,10 +2003,9 @@ func handleAnthropicConvert(w http.ResponseWriter, r *http.Request, openaiReq Op
 
 		shouldRetry, reason := isRetryableError(lastErr, statusCode)
 		if !shouldRetry {
-			break
+			return resp, lastErr
 		}
 
-		lastReason = reason
 		if resp != nil {
 			resp.Body.Close()
 		}
@@ -1676,8 +2017,35 @@ func handleAnthropicConvert(w http.ResponseWriter, r *http.Request, openaiReq Op
 		}
 	}
 
-	if lastErr != nil {
-		appendLog(fmt.Sprintf("❌ 请求失败 (已重试 %d 次): %s - %v", maxRetries, lastReason, lastErr))
+	return resp, lastErr
+}
+
+func handleAnthropicConvert(w http.ResponseWriter, r *http.Request, openaiReq OpenAIRequest) {
+	anthropicReq := convertToAnthropicRequest(openaiReq)
+
+	appendLog(fmt.Sprintf("🔄 转换 Anthropic: model=%s, stream=%v", openaiReq.Model, openaiReq.Stream))
+
+	anthropicBody, _ := json.Marshal(anthropicReq)
+
+	targetURL := config.TargetURL + "/v1/messages"
+
+	req, err := http.NewRequest("POST", targetURL, nil)
+	if err != nil {
+		appendLog(fmt.Sprintf("❌ 创建请求失败: %v", err))
+		http.Error(w, "Failed to create request", http.StatusInternalServerError)
+		return
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	if authHeader := r.Header.Get("Authorization"); authHeader != "" {
+		apiKey := strings.TrimPrefix(authHeader, "Bearer ")
+		req.Header.Set("x-api-key", apiKey)
+	}
+	req.Header.Set("anthropic-version", "2023-06-01")
+
+	resp, err := doRequestWithRetry(req, anthropicBody, 3)
+	if err != nil {
+		appendLog(fmt.Sprintf("❌ 请求失败: %v", err))
 		http.Error(w, "Failed to reach target server", http.StatusBadGateway)
 		return
 	}
@@ -2295,8 +2663,10 @@ func handleStreamResponse(w http.ResponseWriter, resp *http.Response, originalMo
 			}
 			flusher.Flush()
 
-			if len(chunk.Choices) > 0 && chunk.Choices[0].Delta.Content != "" {
-				textChunks++
+			if len(chunk.Choices) > 0 {
+				if content, ok := chunk.Choices[0].Delta.Content.(string); ok && content != "" {
+					textChunks++
+				}
 			}
 		}
 	}
@@ -2314,6 +2684,16 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func toTitleCase(s string) string {
+	words := strings.Fields(s)
+	for i, word := range words {
+		if len(word) > 0 {
+			words[i] = strings.ToUpper(string(word[0])) + strings.ToLower(word[1:])
+		}
+	}
+	return strings.Join(words, " ")
 }
 
 func convertStreamEvent(event AnthropicStreamEvent, messageID, originalModel string, toolCalls map[int]*OpenAIToolCall) *OpenAIStreamChunk {
