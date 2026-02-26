@@ -167,6 +167,36 @@ AnthropicProxy/
 - 在「模型映射」中添加映射规则，源模型会自动注入到模型列表
 - 确认映射规则中的源模型名称与客户端请求的名称一致
 
+## 更新日志
+
+### 2026-02-27
+
+- 新增 Anthropic 入站请求处理：支持客户端直接以 Anthropic 协议（`/v1/messages`）发送请求，自动根据协议模式转发或转换
+- 新增 Anthropic→OpenAI 协议转换：Anthropic 格式请求可自动转换为 OpenAI 格式发送到后端
+- 新增 OpenAI→Anthropic 流式响应转换：将 OpenAI SSE 流式响应实时转换为 Anthropic SSE 格式返回客户端
+- 新增 Anthropic 流式透传模式：Anthropic→Anthropic 场景下直接透传流式响应
+- 新增 thinking/reasoning 内容支持：流式转换中正确处理 `thinking_delta` 和 `reasoning_content` 字段
+- 新增路径归一化函数 `normalizeRequestPath`，统一处理 Gemini `/v1beta/openai/` 和 `/api/v1/` 路径前缀转换
+- 新增目标服务器历史记录：目标服务器输入框改为下拉组合框，支持保存和选择历史地址，支持删除历史记录
+- 新增透传请求头过滤：自动移除 `Accept-Encoding` 和响应中的 `Content-Encoding` 头，避免压缩编码问题
+- 新增 `x-api-key` → `Authorization` 自动转换：透传请求中自动将 Anthropic 风格的认证头转换为 Bearer Token
+- 改进模型列表格式检测：根据客户端类型（Anthropic/OpenAI）智能选择模型列表返回格式，而非仅依赖域名判断
+- 改进 `convertGeminiToOpenAIModelFormat`：同时支持解析 Gemini 原生格式和 OpenAI 格式的模型列表，并注入映射模型
+- 改进 OpenAI 直连模式错误响应：非 200 状态码时正确设置 `Content-Type: application/json`
+- 改进 `convertStreamEvent`：`thinking` 类型的 `content_block_start` 不再生成多余的流式事件
+
+### 2026-02-14
+
+- 修复模型映射表显示乱序问题，改为按源模型名称排序
+- 修复模型映射规则不生效的问题（支持自动去除 `provider/model` 前缀后匹配）
+- 新增请求参数日志输出（model、stream、max_tokens）
+- 新增映射模型自动注入到模型列表，支持 OpenAI、Anthropic、Gemini 三种格式
+- 新增日志模式切换：GUI 实时显示 / 输出到本地日志文件
+- 日志文件每次启动时自动清空，文件输出不限制内容长度
+- UI 调整：「显示日志」复选框移至按钮栏，移除「最小化到托盘」按钮（改为窗口最小化时自动隐藏到托盘）
+- UI 调整：隐藏日志时窗口自动缩小，显示日志时自动恢复
+- 模型映射操作改为右键上下文菜单，支持列标题点击排序
+
 ## 许可证
 
 MIT License

@@ -71,11 +71,12 @@ type OpenAIToolFunction struct {
 }
 
 type OpenAIMessage struct {
-	Role       string           `json:"role"`
-	Content    interface{}      `json:"content"`
-	ToolCalls  []OpenAIToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string           `json:"tool_call_id,omitempty"`
-	Name       string           `json:"name,omitempty"`
+	Role             string           `json:"role"`
+	Content          interface{}      `json:"content"`
+	ReasoningContent interface{}      `json:"reasoning_content,omitempty"`
+	ToolCalls        []OpenAIToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string           `json:"tool_call_id,omitempty"`
+	Name             string           `json:"name,omitempty"`
 }
 
 type OpenAIToolCall struct {
@@ -155,11 +156,12 @@ type AnthropicResponse struct {
 }
 
 type AnthropicContent struct {
-	Type  string          `json:"type"`
-	Text  string          `json:"text,omitempty"`
-	ID    string          `json:"id,omitempty"`    // for tool_use
-	Name  string          `json:"name,omitempty"`  // for tool_use
-	Input json.RawMessage `json:"input,omitempty"` // for tool_use
+	Type     string          `json:"type"`
+	Text     string          `json:"text,omitempty"`
+	Thinking string          `json:"thinking,omitempty"`
+	ID       string          `json:"id,omitempty"`    // for tool_use
+	Name     string          `json:"name,omitempty"`  // for tool_use
+	Input    json.RawMessage `json:"input,omitempty"` // for tool_use
 }
 
 type AnthropicUsage struct {
@@ -179,6 +181,7 @@ type AnthropicStreamEvent struct {
 type AnthropicDelta struct {
 	Type        string `json:"type,omitempty"`
 	Text        string `json:"text,omitempty"`
+	Thinking    string `json:"thinking,omitempty"`
 	StopReason  string `json:"stop_reason,omitempty"`
 	PartialJson string `json:"partial_json,omitempty"` // for tool_use input
 }
@@ -262,34 +265,36 @@ const (
 var protocolModes = []string{"OpenAI (直连)", "Anthropic (Claude)", "OpenAI (转换)"}
 
 type Config struct {
-	TargetURL     string            `json:"target_url"`
-	ListenAddr    string            `json:"listen_addr"`
-	ProtocolMode  int               `json:"protocol_mode"`
-	ModelMappings map[string]string `json:"model_mappings"`
-	ShowLog       bool              `json:"show_log"`
+	TargetURL        string            `json:"target_url"`
+	TargetURLHistory []string          `json:"target_url_history,omitempty"`
+	ListenAddr       string            `json:"listen_addr"`
+	ProtocolMode     int               `json:"protocol_mode"`
+	ModelMappings    map[string]string `json:"model_mappings"`
+	ShowLog          bool              `json:"show_log"`
 }
 
 // ==================== 全局变量 ====================
 
 var (
-	config         Config
-	workDir        string
-	mainWindow     *walk.MainWindow
-	logTextEdit    *walk.TextEdit
-	targetURLEdit  *walk.LineEdit
-	listenAddrEdit *walk.LineEdit
-	protocolCombo  *walk.ComboBox
-	proxyButton    *walk.PushButton
-	certButton     *walk.PushButton
-	testButton     *walk.PushButton
-	statusLabel    *walk.Label
-	notifyIcon     *walk.NotifyIcon
-	mappingTable   *walk.TableView
-	mappingModel   *MappingTableModel
-	logCheckBox    *walk.CheckBox
-	logGroupBox    *walk.GroupBox
-	logBottomBar   *walk.Composite
-	logFile        *os.File
+	config          Config
+	workDir         string
+	mainWindow      *walk.MainWindow
+	logTextEdit     *walk.TextEdit
+	targetURLCombo  *walk.ComboBox
+	deleteURLButton *walk.PushButton
+	listenAddrEdit  *walk.LineEdit
+	protocolCombo   *walk.ComboBox
+	proxyButton     *walk.PushButton
+	certButton      *walk.PushButton
+	testButton      *walk.PushButton
+	statusLabel     *walk.Label
+	notifyIcon      *walk.NotifyIcon
+	mappingTable    *walk.TableView
+	mappingModel    *MappingTableModel
+	logCheckBox     *walk.CheckBox
+	logGroupBox     *walk.GroupBox
+	logBottomBar    *walk.Composite
+	logFile         *os.File
 
 	proxyServer   *http.Server
 	proxyRunning  bool
@@ -305,6 +310,7 @@ var (
 			MaxIdleConns:        100,
 			MaxIdleConnsPerHost: 10,
 			IdleConnTimeout:     90 * time.Second,
+			DisableCompression:  true,
 		},
 	}
 )
@@ -502,10 +508,25 @@ func main() {
 								Layout: Grid{Columns: 2, Spacing: 10},
 								Children: []Widget{
 									Label{Text: "目标服务器:"},
-									LineEdit{
-										AssignTo:    &targetURLEdit,
-										Text:        config.TargetURL,
-										ToolTipText: "API 代理服务器地址",
+									Composite{
+										Layout: HBox{MarginsZero: true},
+										Children: []Widget{
+											ComboBox{
+												AssignTo:      &targetURLCombo,
+												Editable:      true,
+												Model:         config.TargetURLHistory,
+												Value:         config.TargetURL,
+												ToolTipText:   "API 代理服务器地址",
+												StretchFactor: 1,
+											},
+											PushButton{
+												AssignTo:  &deleteURLButton,
+												Text:      "✕",
+												MaxSize:   Size{Width: 28},
+												MinSize:   Size{Width: 28},
+												OnClicked: onDeleteURLClicked,
+											},
+										},
 									},
 									Label{Text: "监听地址:"},
 									LineEdit{
@@ -774,6 +795,10 @@ func loadConfig() {
 			"claude-opus-4-1-20250805":   "claude-opus-4-5-thinking",
 		}
 	}
+
+	if config.TargetURLHistory == nil {
+		config.TargetURLHistory = []string{}
+	}
 }
 
 func getWindowCenterBounds(width, height int) Rectangle {
@@ -809,12 +834,76 @@ func checkCertStatus() {
 }
 
 func saveConfig() {
-	config.TargetURL = targetURLEdit.Text()
+	config.TargetURL = targetURLCombo.Text()
 	config.ListenAddr = listenAddrEdit.Text()
 	config.ProtocolMode = protocolCombo.CurrentIndex()
 
+	url := strings.TrimSpace(config.TargetURL)
+	if url != "" {
+		found := false
+		for _, h := range config.TargetURLHistory {
+			if h == url {
+				found = true
+				break
+			}
+		}
+		if !found {
+			config.TargetURLHistory = append([]string{url}, config.TargetURLHistory...)
+			refreshTargetURLHistory()
+		}
+	}
+
 	data, _ := json.MarshalIndent(config, "", "  ")
 	os.WriteFile(configFile, data, 0644)
+}
+
+func refreshTargetURLHistory() {
+	if targetURLCombo == nil {
+		return
+	}
+	currentText := targetURLCombo.Text()
+	targetURLCombo.SetModel(config.TargetURLHistory)
+	targetURLCombo.SetText(currentText)
+}
+
+func removeTargetURLHistory(index int) {
+	if index < 0 || index >= len(config.TargetURLHistory) {
+		return
+	}
+	removed := config.TargetURLHistory[index]
+	config.TargetURLHistory = append(config.TargetURLHistory[:index], config.TargetURLHistory[index+1:]...)
+	refreshTargetURLHistory()
+	data, _ := json.MarshalIndent(config, "", "  ")
+	os.WriteFile(configFile, data, 0644)
+	appendLog(fmt.Sprintf("🗑️ 已删除历史记录: %s", removed))
+}
+
+func onDeleteURLClicked() {
+	currentText := strings.TrimSpace(targetURLCombo.Text())
+	if currentText == "" {
+		return
+	}
+	idx := -1
+	for i, h := range config.TargetURLHistory {
+		if h == currentText {
+			idx = i
+			break
+		}
+	}
+	if idx >= 0 {
+		config.TargetURLHistory = append(config.TargetURLHistory[:idx], config.TargetURLHistory[idx+1:]...)
+	}
+	if len(config.TargetURLHistory) > 0 {
+		targetURLCombo.SetModel(config.TargetURLHistory)
+		targetURLCombo.SetText(config.TargetURLHistory[0])
+	} else {
+		targetURLCombo.SetModel([]string{})
+		targetURLCombo.SetText("")
+	}
+	config.TargetURL = targetURLCombo.Text()
+	data, _ := json.MarshalIndent(config, "", "  ")
+	os.WriteFile(configFile, data, 0644)
+	appendLog(fmt.Sprintf("🗑️ 已删除历史记录: %s", currentText))
 }
 
 func updateLogMode() {
@@ -853,7 +942,7 @@ func appendLog(msg string) {
 }
 
 func onTestButtonClicked() {
-	targetURL := targetURLEdit.Text()
+	targetURL := targetURLCombo.Text()
 	if targetURL == "" {
 		appendLog("❌ 请输入目标服务器地址")
 		return
@@ -1311,6 +1400,23 @@ func maskAPIKey(key string) string {
 	return key[:10] + "***"
 }
 
+func normalizeRequestPath(path string) string {
+	if config.ProtocolMode == ModeOpenAI {
+		return path
+	}
+	if strings.HasPrefix(path, "/v1beta/openai/") {
+		newPath := strings.Replace(path, "/v1beta/openai/", "/v1/", 1)
+		appendLog(fmt.Sprintf("🔄 路径转换: %s -> %s", path, newPath))
+		return newPath
+	}
+	if strings.HasPrefix(path, "/api/v1/") {
+		newPath := strings.TrimPrefix(path, "/api")
+		appendLog(fmt.Sprintf("🔄 路径转换: %s -> %s", path, newPath))
+		return newPath
+	}
+	return path
+}
+
 func handleRequest(w http.ResponseWriter, r *http.Request) {
 	queryStr := ""
 	if r.URL.RawQuery != "" {
@@ -1318,29 +1424,21 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	appendLog(fmt.Sprintf("➡️ %s %s%s (Host: %s, Auth=%s)", r.Method, r.URL.Path, queryStr, r.Host, maskAPIKey(r.Header.Get("Authorization"))))
 
-	path := r.URL.Path
-	isGeminiHost := r.Host == "generativelanguage.googleapis.com"
-
-	// Gemini 路径转换: /v1beta/openai/xxx -> /v1/xxx
-	if isGeminiHost && strings.HasPrefix(path, "/v1beta/openai/") {
-		path = strings.Replace(path, "/v1beta/openai/", "/v1/", 1)
-		appendLog(fmt.Sprintf("🔄 Gemini 路径转换: %s -> %s", r.URL.Path, path))
-	}
-
-	if strings.HasPrefix(path, "/api/v1/") {
-		path = strings.TrimPrefix(path, "/api")
-	}
+	path := normalizeRequestPath(r.URL.Path)
 
 	if r.Method == "POST" {
+		appendLog(fmt.Sprintf("🔍 路由匹配: path=%s, 原始path=%s, 协议模式=%d", path, r.URL.Path, config.ProtocolMode))
 		switch path {
-		case "/v1/chat/completions":
+		case "/v1/chat/completions", "/v1/completions", "/v1/responses":
 			handleChatCompletion(w, r, path)
 			return
-		case "/v1/completions":
-			handleChatCompletion(w, r, path)
+		case "/v1/messages":
+			handleAnthropicIncoming(w, r)
 			return
-		case "/v1/responses":
-			handleChatCompletion(w, r, path)
+		}
+		if strings.Contains(path, "/messages") {
+			appendLog(fmt.Sprintf("⚠️ 包含 /messages 但未精确匹配: %s", path))
+			handleAnthropicIncoming(w, r)
 			return
 		}
 	}
@@ -1352,18 +1450,9 @@ func handlePassthrough(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	defer r.Body.Close()
 
-	path := r.URL.Path
+	path := normalizeRequestPath(r.URL.Path)
 	targetURL := config.TargetURL
-	isAnthropicHost := r.Host == "api.anthropic.com"
-	isGeminiHost := r.Host == "generativelanguage.googleapis.com"
 
-	// Gemini OpenAI 兼容格式转换: /v1beta/openai/xxx -> /v1/xxx
-	if isGeminiHost && strings.HasPrefix(path, "/v1beta/openai/") {
-		path = strings.Replace(path, "/v1beta/openai/", "/v1/", 1)
-		appendLog(fmt.Sprintf("🔄 Gemini 路径转换: %s -> %s", r.URL.Path, path))
-	}
-
-	// 对 Anthropic API 的 /v1/messages 请求进行模型名称映射
 	if r.Method == "POST" && strings.Contains(path, "/messages") {
 		var reqBody map[string]interface{}
 		if err := json.Unmarshal(body, &reqBody); err == nil {
@@ -1395,10 +1484,6 @@ func handlePassthrough(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if strings.HasPrefix(path, "/api/v1/") {
-		path = strings.TrimPrefix(path, "/api")
-	}
-
 	targetURL = targetURL + path
 	if r.URL.RawQuery != "" {
 		targetURL += "?" + r.URL.RawQuery
@@ -1414,8 +1499,18 @@ func handlePassthrough(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for key, values := range r.Header {
+		if strings.EqualFold(key, "Accept-Encoding") {
+			continue
+		}
 		for _, value := range values {
 			req.Header.Add(key, value)
+		}
+	}
+
+	if req.Header.Get("Authorization") == "" {
+		if apiKey := req.Header.Get("X-Api-Key"); apiKey != "" {
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+			appendLog("🔑 透传: 已转换 x-api-key → Authorization")
 		}
 	}
 
@@ -1439,6 +1534,9 @@ func handlePassthrough(w http.ResponseWriter, r *http.Request) {
 		}
 
 		for key, values := range resp.Header {
+			if strings.EqualFold(key, "Content-Encoding") || strings.EqualFold(key, "Content-Length") {
+				continue
+			}
 			for _, value := range values {
 				w.Header().Add(key, value)
 			}
@@ -1470,14 +1568,21 @@ func handlePassthrough(w http.ResponseWriter, r *http.Request) {
 	respBody, _ := io.ReadAll(resp.Body)
 
 	if strings.Contains(r.URL.Path, "/models") && resp.StatusCode == 200 {
-		if isAnthropicHost {
+		isAnthropicClient := strings.Contains(r.Host, "anthropic") || r.Header.Get("x-api-key") != ""
+		if isAnthropicClient {
 			respBody = convertToAnthropicModelFormat(respBody)
-			appendLog("🔄 已转换模型列表为 Anthropic 格式")
-		} else if isGeminiHost {
-			respBody = convertGeminiToOpenAIModelFormat(respBody)
-			appendLog("🔄 已转换模型列表为 OpenAI 格式 (Gemini)")
+			appendLog("🔄 已转换模型列表为 Anthropic 格式 (客户端检测)")
 		} else {
-			respBody = injectMappingModelsToOpenAI(respBody)
+			switch config.ProtocolMode {
+			case ModeAnthropic:
+				respBody = convertToAnthropicModelFormat(respBody)
+				appendLog("🔄 已转换模型列表为 Anthropic 格式")
+			case ModeOpenAIConvert:
+				respBody = convertGeminiToOpenAIModelFormat(respBody)
+				appendLog("🔄 已转换模型列表为 OpenAI 格式")
+			default:
+				respBody = injectMappingModelsToOpenAI(respBody)
+			}
 		}
 	}
 
@@ -1494,6 +1599,9 @@ func handlePassthrough(w http.ResponseWriter, r *http.Request) {
 
 	for key, values := range resp.Header {
 		if strings.ToLower(key) == "content-length" {
+			continue
+		}
+		if strings.ToLower(key) == "content-encoding" {
 			continue
 		}
 		for _, value := range values {
@@ -1599,17 +1707,6 @@ func convertToAnthropicModelFormat(respBody []byte) []byte {
 }
 
 func convertGeminiToOpenAIModelFormat(respBody []byte) []byte {
-	var geminiResp struct {
-		Models []struct {
-			Name        string `json:"name"`
-			DisplayName string `json:"displayName"`
-		} `json:"models"`
-	}
-
-	if err := json.Unmarshal(respBody, &geminiResp); err != nil {
-		return respBody
-	}
-
 	type OpenAIModel struct {
 		ID      string `json:"id"`
 		Object  string `json:"object"`
@@ -1618,19 +1715,50 @@ func convertGeminiToOpenAIModelFormat(respBody []byte) []byte {
 	}
 
 	var models []OpenAIModel
-	for _, m := range geminiResp.Models {
-		modelID := m.DisplayName
-		if modelID == "" {
-			modelID = strings.TrimPrefix(m.Name, "models/")
-		}
 
-		if strings.HasPrefix(modelID, "gemini") {
+	var geminiResp struct {
+		Models []struct {
+			Name        string `json:"name"`
+			DisplayName string `json:"displayName"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(respBody, &geminiResp); err == nil && len(geminiResp.Models) > 0 {
+		for _, m := range geminiResp.Models {
+			modelID := m.DisplayName
+			if modelID == "" {
+				modelID = strings.TrimPrefix(m.Name, "models/")
+			}
 			models = append(models, OpenAIModel{
 				ID:      modelID,
 				Object:  "model",
 				Created: time.Now().Unix(),
 				OwnedBy: "google",
 			})
+		}
+	} else {
+		var openaiResp struct {
+			Data []OpenAIModel `json:"data"`
+		}
+		if err := json.Unmarshal(respBody, &openaiResp); err == nil && len(openaiResp.Data) > 0 {
+			models = openaiResp.Data
+		}
+	}
+
+	existingIDs := make(map[string]bool)
+	for _, m := range models {
+		existingIDs[m.ID] = true
+	}
+	if config.ModelMappings != nil {
+		for source := range config.ModelMappings {
+			if !existingIDs[source] {
+				models = append(models, OpenAIModel{
+					ID:      source,
+					Object:  "model",
+					Created: time.Now().Unix(),
+					OwnedBy: "mapped",
+				})
+				existingIDs[source] = true
+			}
 		}
 	}
 
@@ -1642,7 +1770,7 @@ func convertGeminiToOpenAIModelFormat(respBody []byte) []byte {
 	for _, m := range models {
 		modelIDs = append(modelIDs, m.ID)
 	}
-	appendLog(fmt.Sprintf("📋 Gemini 模型列表 (%d 个): %v", len(models), modelIDs))
+	appendLog(fmt.Sprintf("📋 OpenAI转换 模型列表 (%d 个): %v", len(models), modelIDs))
 
 	response := map[string]interface{}{
 		"object": "list",
@@ -1804,20 +1932,18 @@ func handleOpenAIDirect(w http.ResponseWriter, r *http.Request, body []byte, ope
 		respBody, _ := io.ReadAll(resp.Body)
 		appendLog(fmt.Sprintf("❌ 错误响应: %s", string(respBody[:min(500, len(respBody))])))
 		for k, v := range resp.Header {
+			if strings.EqualFold(k, "Content-Encoding") || strings.EqualFold(k, "Content-Length") {
+				continue
+			}
 			w.Header()[k] = v
 		}
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(respBody)))
 		w.WriteHeader(resp.StatusCode)
 		w.Write(respBody)
 		return
 	}
 
-	for k, v := range resp.Header {
-		w.Header()[k] = v
-	}
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
-
-	appendLog("⬅️ OpenAI 响应已透传")
+	handleOpenAIStreamResponse(w, resp, openaiReq.Model)
 }
 
 // OpenAI 转换模式 - 将请求转换为标准 OpenAI 格式发送
@@ -1883,6 +2009,7 @@ func handleOpenAIStreamResponse(w http.ResponseWriter, resp *http.Response, orig
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		appendLog(fmt.Sprintf("❌ OpenAI 错误 %d: %s", resp.StatusCode, string(body)))
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
 		w.Write(body)
 		return
@@ -1926,25 +2053,11 @@ func handleOpenAIStreamResponse(w http.ResponseWriter, resp *http.Response, orig
 			break
 		}
 
-		var chunk OpenAIStreamChunk
-		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			continue
-		}
-
 		eventCount++
-		chunkData, _ := json.Marshal(chunk)
-		_, writeErr := fmt.Fprintf(w, "data: %s\n\n", chunkData)
-		if writeErr != nil {
-			appendLog(fmt.Sprintf("❌ 写入响应失败: %v", writeErr))
-			break
-		}
-		flusher.Flush()
 
-		if len(chunk.Choices) > 0 {
-			if content, ok := chunk.Choices[0].Delta.Content.(string); ok && content != "" {
-				textChunks++
-			}
-		}
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+		textChunks++
 	}
 
 	if !sentDone {
@@ -1953,6 +2066,558 @@ func handleOpenAIStreamResponse(w http.ResponseWriter, resp *http.Response, orig
 	}
 
 	appendLog(fmt.Sprintf("⬅️ OpenAI Stream 完成，处理了 %d 个事件，%d 个文本块", eventCount, textChunks))
+}
+
+func handleAnthropicIncoming(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		appendLog(fmt.Sprintf("❌ 读取请求失败: %v", err))
+		http.Error(w, "Failed to read request", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	var anthropicReq AnthropicRequest
+	if err := json.Unmarshal(body, &anthropicReq); err != nil {
+		appendLog(fmt.Sprintf("❌ 解析 Anthropic 请求失败: %v", err))
+		http.Error(w, "Failed to parse request", http.StatusBadRequest)
+		return
+	}
+
+	originalModel := anthropicReq.Model
+	if strings.Contains(anthropicReq.Model, "/") {
+		parts := strings.SplitN(anthropicReq.Model, "/", 2)
+		if len(parts) == 2 {
+			anthropicReq.Model = parts[1]
+		}
+	}
+
+	if config.ModelMappings != nil {
+		if mappedModel, exists := config.ModelMappings[anthropicReq.Model]; exists {
+			appendLog(fmt.Sprintf("🔄 模型映射: %s -> %s", anthropicReq.Model, mappedModel))
+			anthropicReq.Model = mappedModel
+		}
+	}
+
+	if originalModel != anthropicReq.Model {
+		appendLog(fmt.Sprintf("📥 Anthropic入站: model=%s (原始: %s), stream=%v", anthropicReq.Model, originalModel, anthropicReq.Stream))
+	} else {
+		appendLog(fmt.Sprintf("📥 Anthropic入站: model=%s, stream=%v", anthropicReq.Model, anthropicReq.Stream))
+	}
+
+	switch config.ProtocolMode {
+	case ModeAnthropic:
+		appendLog("🔄 Anthropic→Anthropic 透传模式")
+		anthropicReq.Stream = true
+		anthropicBody, _ := json.Marshal(anthropicReq)
+		targetURL := config.TargetURL + "/v1/messages"
+		req, err := http.NewRequest("POST", targetURL, nil)
+		if err != nil {
+			appendLog(fmt.Sprintf("❌ 创建请求失败: %v", err))
+			http.Error(w, "Failed to create request", http.StatusInternalServerError)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if apiKey := r.Header.Get("x-api-key"); apiKey != "" {
+			req.Header.Set("x-api-key", apiKey)
+		} else if authHeader := r.Header.Get("Authorization"); authHeader != "" {
+			apiKey := strings.TrimPrefix(authHeader, "Bearer ")
+			req.Header.Set("x-api-key", apiKey)
+		}
+		req.Header.Set("anthropic-version", "2023-06-01")
+		resp, err := doRequestWithRetry(req, anthropicBody, 3)
+		if err != nil {
+			appendLog(fmt.Sprintf("❌ 请求失败: %v", err))
+			http.Error(w, "Failed to reach target server", http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		handleAnthropicStreamPassthrough(w, resp)
+
+	default:
+		openaiReq := convertAnthropicToOpenAIRequest(anthropicReq)
+		openaiReq.Stream = true
+		appendLog(fmt.Sprintf("🔄 Anthropic→OpenAI 协议转换: model=%s, messages=%d", openaiReq.Model, len(openaiReq.Messages)))
+
+		apiKey := r.Header.Get("x-api-key")
+		if apiKey == "" {
+			if authHeader := r.Header.Get("Authorization"); authHeader != "" {
+				apiKey = strings.TrimPrefix(authHeader, "Bearer ")
+			}
+		}
+
+		openaiBody, _ := json.Marshal(openaiReq)
+		targetURL := config.TargetURL + "/v1/chat/completions"
+		appendLog(fmt.Sprintf("📤 目标: %s", targetURL))
+
+		req, err := http.NewRequest("POST", targetURL, nil)
+		if err != nil {
+			appendLog(fmt.Sprintf("❌ 创建请求失败: %v", err))
+			http.Error(w, "Failed to create request", http.StatusInternalServerError)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if apiKey != "" {
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+		}
+
+		resp, err := doRequestWithRetry(req, openaiBody, 3)
+		if err != nil {
+			appendLog(fmt.Sprintf("❌ 请求失败: %v", err))
+			http.Error(w, "Failed to reach target server", http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		handleOpenAIToAnthropicStream(w, resp, anthropicReq.Model)
+	}
+}
+
+func handleOpenAIToAnthropicStream(w http.ResponseWriter, resp *http.Response, model string) {
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		appendLog(fmt.Sprintf("❌ OpenAI 错误 %d: %s", resp.StatusCode, string(body[:min(500, len(body))])))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		w.Write(body)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		appendLog("❌ 不支持流式响应")
+		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	msgID := fmt.Sprintf("msg_%d", time.Now().UnixNano())
+
+	startEvent := map[string]interface{}{
+		"type": "message_start",
+		"message": map[string]interface{}{
+			"id":      msgID,
+			"type":    "message",
+			"role":    "assistant",
+			"model":   model,
+			"content": []interface{}{},
+			"usage":   map[string]int{"input_tokens": 0, "output_tokens": 0},
+		},
+	}
+	startData, _ := json.Marshal(startEvent)
+	fmt.Fprintf(w, "event: message_start\ndata: %s\n\n", startData)
+	flusher.Flush()
+
+	blockStarted := false
+	contentIdx := 0
+	reader := bufio.NewReaderSize(resp.Body, 128*1024)
+	eventCount := 0
+	textChunks := 0
+
+	emitText := func(text string) {
+		if text == "" {
+			return
+		}
+		if !blockStarted {
+			blockStart := map[string]interface{}{
+				"type":          "content_block_start",
+				"index":         contentIdx,
+				"content_block": map[string]interface{}{"type": "text", "text": ""},
+			}
+			bsData, _ := json.Marshal(blockStart)
+			fmt.Fprintf(w, "event: content_block_start\ndata: %s\n\n", bsData)
+			flusher.Flush()
+			blockStarted = true
+		}
+		delta := map[string]interface{}{
+			"type":  "content_block_delta",
+			"index": contentIdx,
+			"delta": map[string]interface{}{"type": "text_delta", "text": text},
+		}
+		dData, _ := json.Marshal(delta)
+		fmt.Fprintf(w, "event: content_block_delta\ndata: %s\n\n", dData)
+		flusher.Flush()
+		textChunks++
+	}
+
+	emitThinking := func(text string) {
+		if text == "" {
+			return
+		}
+		if !blockStarted {
+			blockStart := map[string]interface{}{
+				"type":          "content_block_start",
+				"index":         contentIdx,
+				"content_block": map[string]interface{}{"type": "thinking", "thinking": ""},
+			}
+			bsData, _ := json.Marshal(blockStart)
+			fmt.Fprintf(w, "event: content_block_start\ndata: %s\n\n", bsData)
+			flusher.Flush()
+			blockStarted = true
+		}
+		delta := map[string]interface{}{
+			"type":  "content_block_delta",
+			"index": contentIdx,
+			"delta": map[string]interface{}{"type": "thinking_delta", "thinking": text},
+		}
+		dData, _ := json.Marshal(delta)
+		fmt.Fprintf(w, "event: content_block_delta\ndata: %s\n\n", dData)
+		flusher.Flush()
+	}
+
+	closeBlock := func() {
+		if blockStarted {
+			blockStop := map[string]interface{}{
+				"type":  "content_block_stop",
+				"index": contentIdx,
+			}
+			bsData, _ := json.Marshal(blockStop)
+			fmt.Fprintf(w, "event: content_block_stop\ndata: %s\n\n", bsData)
+			flusher.Flush()
+			contentIdx++
+			blockStarted = false
+		}
+	}
+
+	lastWasThinking := false
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			appendLog(fmt.Sprintf("❌ 读取流失败: %v", err))
+			break
+		}
+
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			break
+		}
+
+		var chunk OpenAIStreamChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+
+		eventCount++
+
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+
+		choice := chunk.Choices[0]
+
+		if choice.Delta.ReasoningContent != nil {
+			thinking, ok := choice.Delta.ReasoningContent.(string)
+			if ok && thinking != "" {
+				if lastWasThinking == false && blockStarted {
+					closeBlock()
+				}
+				lastWasThinking = true
+				emitThinking(thinking)
+			}
+			continue
+		}
+
+		if choice.Delta.Content != nil {
+			text, ok := choice.Delta.Content.(string)
+			if !ok || text == "" {
+				continue
+			}
+			if lastWasThinking && blockStarted {
+				closeBlock()
+			}
+			lastWasThinking = false
+			emitText(text)
+		}
+
+		if len(choice.Delta.ToolCalls) > 0 {
+			closeBlock()
+			for _, tc := range choice.Delta.ToolCalls {
+				if tc.ID != "" {
+					if blockStarted {
+						blockStop := map[string]interface{}{
+							"type":  "content_block_stop",
+							"index": contentIdx,
+						}
+						bsData, _ := json.Marshal(blockStop)
+						fmt.Fprintf(w, "event: content_block_stop\ndata: %s\n\n", bsData)
+						flusher.Flush()
+						contentIdx++
+						blockStarted = false
+					}
+
+					blockStart := map[string]interface{}{
+						"type":  "content_block_start",
+						"index": contentIdx,
+						"content_block": map[string]interface{}{
+							"type":  "tool_use",
+							"id":    tc.ID,
+							"name":  tc.Function.Name,
+							"input": map[string]interface{}{},
+						},
+					}
+					bsData, _ := json.Marshal(blockStart)
+					fmt.Fprintf(w, "event: content_block_start\ndata: %s\n\n", bsData)
+					flusher.Flush()
+					blockStarted = true
+				}
+
+				if tc.Function.Arguments != "" {
+					delta := map[string]interface{}{
+						"type":  "content_block_delta",
+						"index": contentIdx,
+						"delta": map[string]interface{}{
+							"type":         "input_json_delta",
+							"partial_json": tc.Function.Arguments,
+						},
+					}
+					dData, _ := json.Marshal(delta)
+					fmt.Fprintf(w, "event: content_block_delta\ndata: %s\n\n", dData)
+					flusher.Flush()
+				}
+			}
+		}
+
+		if choice.FinishReason != "" {
+			closeBlock()
+
+			stopReason := "end_turn"
+			switch choice.FinishReason {
+			case "length":
+				stopReason = "max_tokens"
+			case "tool_calls":
+				stopReason = "tool_use"
+			case "stop":
+				stopReason = "end_turn"
+			}
+
+			msgDelta := map[string]interface{}{
+				"type":  "message_delta",
+				"delta": map[string]interface{}{"stop_reason": stopReason},
+				"usage": map[string]int{"output_tokens": 0},
+			}
+			mdData, _ := json.Marshal(msgDelta)
+			fmt.Fprintf(w, "event: message_delta\ndata: %s\n\n", mdData)
+			flusher.Flush()
+		}
+	}
+
+	msgStop := map[string]interface{}{"type": "message_stop"}
+	msData, _ := json.Marshal(msgStop)
+	fmt.Fprintf(w, "event: message_stop\ndata: %s\n\n", msData)
+	flusher.Flush()
+
+	appendLog(fmt.Sprintf("⬅️ OpenAI→Anthropic Stream 转换完成，处理了 %d 个事件，%d 个文本块", eventCount, textChunks))
+}
+
+func handleAnthropicStreamPassthrough(w http.ResponseWriter, resp *http.Response) {
+	if resp.StatusCode != 200 {
+		respBody, _ := io.ReadAll(resp.Body)
+		appendLog(fmt.Sprintf("❌ Anthropic 错误 %d: %s", resp.StatusCode, string(respBody[:min(500, len(respBody))])))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		w.Write(respBody)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		appendLog("❌ 不支持流式响应")
+		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	flusher.Flush()
+
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := resp.Body.Read(buf)
+		if n > 0 {
+			w.Write(buf[:n])
+			flusher.Flush()
+		}
+		if err != nil {
+			if err != io.EOF {
+				appendLog(fmt.Sprintf("❌ 读取流失败: %v", err))
+			}
+			break
+		}
+	}
+	appendLog("⬅️ Anthropic 透传流式响应完成")
+}
+
+func convertAnthropicToOpenAIRequest(req AnthropicRequest) OpenAIRequest {
+	openaiReq := OpenAIRequest{
+		Model:       req.Model,
+		MaxTokens:   req.MaxTokens,
+		Temperature: req.Temperature,
+		TopP:        req.TopP,
+		Stream:      req.Stream,
+	}
+
+	if len(req.StopSequences) > 0 {
+		openaiReq.Stop = req.StopSequences
+	}
+
+	if req.System != "" {
+		openaiReq.Messages = append(openaiReq.Messages, OpenAIMessage{
+			Role:    "system",
+			Content: req.System,
+		})
+	}
+
+	for _, msg := range req.Messages {
+		switch contentBlocks := msg.Content.(type) {
+		case string:
+			openaiReq.Messages = append(openaiReq.Messages, OpenAIMessage{
+				Role:    msg.Role,
+				Content: contentBlocks,
+			})
+		case []interface{}:
+			var toolCalls []OpenAIToolCall
+			var textParts []interface{}
+			var imageParts []interface{}
+			var toolResults []map[string]interface{}
+
+			for _, block := range contentBlocks {
+				if m, ok := block.(map[string]interface{}); ok {
+					blockType, _ := m["type"].(string)
+					switch blockType {
+					case "text":
+						text, _ := m["text"].(string)
+						textParts = append(textParts, map[string]interface{}{
+							"type": "text",
+							"text": text,
+						})
+					case "image":
+						if source, ok := m["source"].(map[string]interface{}); ok {
+							sourceType, _ := source["type"].(string)
+							if sourceType == "base64" {
+								mediaType, _ := source["media_type"].(string)
+								data, _ := source["data"].(string)
+								if mediaType != "" && data != "" {
+									dataURL := "data:" + mediaType + ";base64," + data
+									imageParts = append(imageParts, map[string]interface{}{
+										"type": "image_url",
+										"image_url": map[string]interface{}{
+											"url": dataURL,
+										},
+									})
+								}
+							} else if sourceType == "url" {
+								imgURL, _ := source["url"].(string)
+								if imgURL != "" {
+									imageParts = append(imageParts, map[string]interface{}{
+										"type": "image_url",
+										"image_url": map[string]interface{}{
+											"url": imgURL,
+										},
+									})
+								}
+							}
+						}
+					case "tool_use":
+						id, _ := m["id"].(string)
+						name, _ := m["name"].(string)
+						input, _ := json.Marshal(m["input"])
+						toolCalls = append(toolCalls, OpenAIToolCall{
+							ID:   id,
+							Type: "function",
+							Function: OpenAIFunctionCall{
+								Name:      name,
+								Arguments: string(input),
+							},
+						})
+					case "tool_result":
+						toolResults = append(toolResults, m)
+					}
+				}
+			}
+
+			if msg.Role == "assistant" && len(toolCalls) > 0 {
+				assistantMsg := OpenAIMessage{
+					Role:      "assistant",
+					ToolCalls: toolCalls,
+				}
+				if len(textParts) == 1 {
+					if m, ok := textParts[0].(map[string]interface{}); ok {
+						assistantMsg.Content = m["text"]
+					}
+				} else if len(textParts) > 1 {
+					assistantMsg.Content = textParts
+				}
+				openaiReq.Messages = append(openaiReq.Messages, assistantMsg)
+			} else if len(toolResults) > 0 {
+				for _, tr := range toolResults {
+					toolUseID, _ := tr["tool_use_id"].(string)
+					content := ""
+					if c, ok := tr["content"].(string); ok {
+						content = c
+					}
+					openaiReq.Messages = append(openaiReq.Messages, OpenAIMessage{
+						Role:       "tool",
+						Content:    content,
+						ToolCallID: toolUseID,
+					})
+				}
+			} else if len(imageParts) > 0 || len(textParts) > 0 {
+				var allParts []interface{}
+				allParts = append(allParts, textParts...)
+				allParts = append(allParts, imageParts...)
+				openaiReq.Messages = append(openaiReq.Messages, OpenAIMessage{
+					Role:    msg.Role,
+					Content: allParts,
+				})
+			}
+		default:
+			openaiReq.Messages = append(openaiReq.Messages, OpenAIMessage{
+				Role:    msg.Role,
+				Content: fmt.Sprintf("%v", msg.Content),
+			})
+		}
+	}
+
+	if len(req.Tools) > 0 {
+		for _, tool := range req.Tools {
+			openaiReq.Tools = append(openaiReq.Tools, OpenAITool{
+				Type: "function",
+				Function: OpenAIToolFunction{
+					Name:        tool.Name,
+					Description: tool.Description,
+					Parameters:  tool.InputSchema,
+				},
+			})
+		}
+		appendLog(fmt.Sprintf("🔧 转换 %d 个工具定义 (Anthropic→OpenAI)", len(openaiReq.Tools)))
+	}
+
+	if len(openaiReq.Messages) == 0 {
+		openaiReq.Messages = []OpenAIMessage{{Role: "user", Content: "Hello"}}
+	}
+
+	return openaiReq
 }
 
 // Anthropic 转换模式
@@ -2602,6 +3267,7 @@ func handleStreamResponse(w http.ResponseWriter, resp *http.Response, originalMo
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		appendLog(fmt.Sprintf("❌ Anthropic 错误 %d: %s", resp.StatusCode, string(body)))
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
 		w.Write(body)
 		return
@@ -2699,6 +3365,9 @@ func toTitleCase(s string) string {
 func convertStreamEvent(event AnthropicStreamEvent, messageID, originalModel string, toolCalls map[int]*OpenAIToolCall) *OpenAIStreamChunk {
 	switch event.Type {
 	case "content_block_start":
+		if event.ContentBlock != nil && event.ContentBlock.Type == "thinking" {
+			return nil
+		}
 		if event.ContentBlock != nil && event.ContentBlock.Type == "tool_use" {
 			toolCall := &OpenAIToolCall{
 				ID:    event.ContentBlock.ID,
@@ -2727,6 +3396,16 @@ func convertStreamEvent(event AnthropicStreamEvent, messageID, originalModel str
 
 	case "content_block_delta":
 		if event.Delta != nil {
+			if event.Delta.Type == "thinking_delta" && event.Delta.Thinking != "" {
+				return &OpenAIStreamChunk{
+					ID:      messageID,
+					Object:  "chat.completion.chunk",
+					Created: time.Now().Unix(),
+					Model:   originalModel,
+					Choices: []OpenAIChoice{{Index: 0, Delta: OpenAIMessage{ReasoningContent: event.Delta.Thinking}}},
+				}
+			}
+
 			if event.Delta.Text != "" {
 				return &OpenAIStreamChunk{
 					ID:      messageID,
